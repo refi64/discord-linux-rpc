@@ -63,14 +63,17 @@ bool BaseConnection::Open()
     setsockopt(self->sock, SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval));
 #endif
 
-    for (int pipeNum = 0; pipeNum < 10; ++pipeNum) {
-        snprintf(
-          PipeAddr.sun_path, sizeof(PipeAddr.sun_path), "%s/discord-ipc-%d", tempPath, pipeNum);
-        int err = connect(self->sock, (const sockaddr*)&PipeAddr, sizeof(PipeAddr));
-        if (err == 0) {
-            self->isOpen = true;
-            return true;
-        }
+    for (int dir = 0; dir < 2; ++dir) {
+      for (int pipeNum = 0; pipeNum < 10; ++pipeNum) {
+          snprintf(
+            PipeAddr.sun_path, sizeof(PipeAddr.sun_path),
+            dir ? "%s/discord/ipc-%d" : "%s/discord-ipc-%d", tempPath, pipeNum);
+          int err = connect(self->sock, (const sockaddr*)&PipeAddr, sizeof(PipeAddr));
+          if (err == 0) {
+              self->isOpen = true;
+              return true;
+          }
+      }
     }
     self->Close();
     return false;

@@ -15,6 +15,8 @@
 #include <thread>
 #endif
 
+#include <signal.h>
+
 constexpr size_t MaxMessageSize{16 * 1024};
 constexpr size_t MessageQueueSize{8};
 constexpr size_t JoinQueueSize{8};
@@ -239,6 +241,7 @@ static void Discord_UpdateConnection(void)
 
 static void SignalIOActivity()
 {
+    raise(SIGUSR1);
     if (IoThread != nullptr) {
         IoThread->Notify();
     }
