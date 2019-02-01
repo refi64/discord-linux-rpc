@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdio.h>
@@ -19,10 +20,12 @@
 
 #include <discord_rpc.h>
 
-#define CLIENT_ID "540225049219563560"
-
 char *strdup0(const char *s) {
   return s ? strdup(s) : NULL;
+}
+
+int startswith(const char *s, const char *b) {
+  return strncmp(s, b, strlen(b)) == 0;
 }
 
 int endswith(const char *s, const char *e) {
@@ -77,11 +80,6 @@ typedef enum ConfigMatchType ConfigMatchType;
 typedef struct ConfigEntry ConfigEntry;
 typedef struct ActiveProcess ActiveProcess;
 
-enum ConfigMatchType {
-  CONFIG_MATCH_NAME,
-  CONFIG_MATCH_PATH,
-};
-
 struct ConfigEntry {
   enum {
     CONFIG_NULL,
@@ -97,12 +95,15 @@ struct ActiveProcess {
   pid_t pid;
   char *path;
   char *name;
+  int64_t start;
   char *client_id;
   char *state;
 };
 
 ConfigEntry *g_config = NULL;
-ActiveProcess g_active = {-1, NULL, NULL, NULL};
+ActiveProcess g_active = {-1, NULL, NULL, -1, NULL, NULL};
+
+int64_t g_boot_time = -1;
 
 sig_atomic_t g_is_done = 0, g_discord_events_waiting = 0;
 
@@ -280,7 +281,7 @@ int load_config() {
       if (feof(fp)) {
         break;
       } else {
-        perror("getline");
+        perror("getline(config)");
         return -1;
       }
     }
@@ -300,9 +301,9 @@ int load_config() {
     bzero(current, sizeof(ConfigEntry) * 2);
     g_config = new_config;
 
-    if (strncmp(p, "name ", 5) == 0) {
+    if (startswith(p, "name ")) {
       current->type = CONFIG_MATCH_NAME;
-    } else if (strncmp(p, "path ", 5) == 0) {
+    } else if (startswith(p, "path ")) {
       current->type = CONFIG_MATCH_PATH;
     } else {
       goto invalid_line;
@@ -384,6 +385,7 @@ void update_discord_presence() {
 
     DiscordRichPresence rp = {0};
     rp.state = g_active.state;
+    rp.startTimestamp = g_boot_time + g_active.start;
     Discord_UpdatePresence(&rp);
   } else {
     puts("update_discord_presence: clear active");
@@ -391,7 +393,43 @@ void update_discord_presence() {
   }
 }
 
-void read_process_info(int pidfd, char **path, char **name) {
+int read_boot_time(int procfd) {
+  cleanup(closep) int statfd = openat(procfd, "stat", O_RDONLY);
+  if (statfd == -1) {
+    perror("openat(/proc/stat)");
+    return -1;
+  }
+
+  cleanup(fclosep) FILE *fp = fdopen(statfd, "r");
+  if (fp == NULL) {
+    perror("fdopen(/proc/stat)");
+    return -1;
+  }
+  steali(&statfd);
+
+  for (;;) {
+    cleanup(freep) char *line = NULL;
+    size_t len = 0;
+
+    if (getline(&line, &len, fp) == -1) {
+      if (feof(fp)) {
+        break;
+      } else {
+        perror("getline(/proc/stat)");
+        return -1;
+      }
+    }
+
+    if (startswith(line, "btime ")) {
+      g_boot_time = strtoll(line + 5, NULL, 10);
+      return 0;
+    }
+  }
+
+  return -1;
+}
+
+void read_process_info(int pidfd, char **path, char **name, int64_t *start) {
   char linkbuf[PATH_MAX];
   ssize_t written = readlinkat(pidfd, "exe", linkbuf, sizeof(linkbuf) - 1);
   if (written == -1) {
@@ -407,7 +445,7 @@ void read_process_info(int pidfd, char **path, char **name) {
 after_link: ;
 
   cleanup(closep) int cmdfd = -1;
-  cleanup(fclosep) FILE *fp = NULL;
+  cleanup(fclosep) FILE *cmdfp = NULL;
 
   cmdfd = openat(pidfd, "cmdline", O_RDONLY);
   if (cmdfd == -1) {
@@ -415,15 +453,15 @@ after_link: ;
     goto after_name;
   }
 
-  fp = fdopen(cmdfd, "r");
-  if (fp == NULL) {
+  cmdfp = fdopen(cmdfd, "r");
+  if (cmdfp == NULL) {
     perror("fdopen(procfd/pid/cmdline)");
     goto after_name;
   }
   steali(&cmdfd);
 
   size_t len;
-  if (getdelim(name, &len, '\0', fp) == -1) {
+  if (getdelim(name, &len, '\0', cmdfp) == -1) {
     // ???
     if (errno != ENOENT) {
       perror("getdelim(procfd/pid/cmdline)");
@@ -432,7 +470,44 @@ after_link: ;
     goto after_name;
   }
 
-after_name:
+after_name: ;
+
+  cleanup(closep) int statfd = -1;
+  cleanup(fclosep) FILE *statfp = NULL;
+  cleanup(freep) char *starttime_s = NULL;\
+  uint64_t starttime = 0;
+
+  statfd = openat(pidfd, "stat", O_RDONLY);
+  if (statfd == -1) {
+    perror("openat(procfd/pid/stat)");
+    goto after_stat;
+  }
+
+  statfp = fdopen(statfd, "r");
+  if (statfp == NULL) {
+    perror("fdopen(procfd/pid/stat)");
+    goto after_stat;
+  }
+  steali(&statfd);
+
+  for (int i = 0; i < 22; i++) {
+    cleanup(freep) char *part = NULL;
+    if (getdelim(&part, &len, ' ', statfp) == -1) {
+      perror("getdelim(procfd/pid/stat)");
+      goto after_stat;
+    }
+
+    if (i == 21) {
+      // Last item is starttime
+      starttime_s = stealp(&part);
+    }
+  }
+
+  starttime = strtoull(starttime_s, NULL, 10);
+  *start = starttime / sysconf(_SC_CLK_TCK);
+
+after_stat: ;
+
   return;
 }
 
@@ -485,7 +560,8 @@ ConfigEntry * try_set_active_process_pidstr(int procfd, const char *pid, ConfigE
 
   cleanup(freep) char *path = NULL;
   cleanup(freep) char *name = NULL;
-  read_process_info(pidfd, &path, &name);
+  int64_t start = -1;
+  read_process_info(pidfd, &path, &name, &start);
 
   if (path == NULL && name == NULL) {
     return NULL;
@@ -496,6 +572,7 @@ ConfigEntry * try_set_active_process_pidstr(int procfd, const char *pid, ConfigE
     g_active.pid = strtol(pid, NULL, 10);
     g_active.path = stealp(&path);
     g_active.name = stealp(&name);
+    g_active.start = start;
     g_active.client_id = strdup(entry->client_id);
     g_active.state = strdup0(entry->state);
     printf("Set active process to %u:%s(%s)\n", g_active.pid, g_active.path, g_active.name);
@@ -592,6 +669,10 @@ int handle_events(int nlfd, int epfd, sigset_t *orig_mask) {
   cleanup(closep) int procfd = openat(-1, "/proc", O_DIRECTORY|O_RDONLY);
   if (procfd == -1) {
     perror("openat(/proc)");
+    return -1;
+  }
+
+  if (read_boot_time(procfd) == -1) {
     return -1;
   }
 
