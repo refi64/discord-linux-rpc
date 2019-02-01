@@ -274,7 +274,7 @@ int load_config() {
 
   for (;;) {
     cleanup(freep) char *line = NULL;
-    char *p = NULL, *match = NULL, *state = NULL;
+    char *p = NULL, *type, *match = NULL, *state = NULL;
     size_t len = 0;
 
     if (getline(&line, &len, fp) == -1) {
@@ -290,7 +290,6 @@ int load_config() {
     if (*p == '\0') {
       continue;
     }
-    rchomp(line);
 
     ConfigEntry *new_config = realloc(g_config, (entries + 2) * sizeof(ConfigEntry));
     if (new_config == NULL) {
@@ -301,9 +300,40 @@ int load_config() {
     bzero(current, sizeof(ConfigEntry) * 2);
     g_config = new_config;
 
-    if (startswith(p, "name ")) {
+    type = strstr(p, " ");
+    if (!type) {
+      goto invalid_line;
+    }
+
+    *type = '\0';
+    type = skip_ws(type + 1);
+    if (*type == '\0') {
+      goto invalid_line;
+    }
+
+    match = strstr(type, " ");
+    if (!match) {
+      goto invalid_line;
+    }
+
+    *match = '\0';
+    match = skip_ws(match + 1);
+    if (*match == '\0') {
+      goto invalid_line;
+    }
+
+    state = strstr(match, " -- ");
+    if (state) {
+      *state = '\0';
+      state = skip_ws(state + 4);
+      if (*state == '\0') {
+        goto invalid_line;
+      }
+    }
+
+    if (strcmp(type, "name") == 0) {
       current->type = CONFIG_MATCH_NAME;
-    } else if (startswith(p, "path ")) {
+    } else if (strcmp(type, "path") == 0) {
       current->type = CONFIG_MATCH_PATH;
     } else {
       goto invalid_line;
@@ -314,25 +344,7 @@ int load_config() {
       goto invalid_line;
     }
 
-    match = strstr(p, " ");
-    if (match == NULL) {
-      goto invalid_line;
-    }
-
-    *match = '\0';
-    match++;
-
-    state = strstr(match, " -- ");
-    if (state) {
-      *state = '\0';
-      state = skip_ws(state + 4);
-      if (*state == '\0') {
-        goto invalid_line;
-      }
-
-      rchomp(state);
-    }
-
+    rchomp(line);
     rchomp(p);
     rchomp(match);
 
