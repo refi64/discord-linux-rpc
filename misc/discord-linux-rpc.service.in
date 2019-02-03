@@ -1,0 +1,8 @@
+[Unit]
+Description=Discord rich presence process monitor
+
+[Service]
+Exec=@prefix@/@bindir@/discord-linux-rpc
+
+[Install]
+WantedBy=default.target
