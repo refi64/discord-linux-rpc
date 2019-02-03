@@ -5,6 +5,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,8 @@
 #include <linux/cn_proc.h>
 #include <linux/connector.h>
 #include <linux/netlink.h>
+
+#include <systemd/sd-daemon.h>
 
 #include <discord_rpc.h>
 
@@ -76,6 +79,41 @@ void closedirp(DIR **p) {
   }
 }
 
+void logv(const char *prefix, const char *fmt, va_list args) {
+  fputs(prefix, stderr);
+  vfprintf(stderr, fmt, args);
+}
+
+__attribute__((format(printf, 1, 2))) void log_info(const char *fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+
+  logv(SD_INFO, fmt, args);
+  fputc('\n', stderr);
+
+  va_end(args);
+}
+
+__attribute__((format(printf, 1, 2))) void log_error(const char *fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+
+  logv(SD_ERR, fmt, args);
+  fputc('\n', stderr);
+
+  va_end(args);
+}
+
+__attribute__((format(printf, 2, 3))) void log_errno(int errno_, const char *fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+
+  logv(SD_ERR, fmt, args);
+  fprintf(stderr, ": %s\n", strerror(errno_));
+
+  va_end(args);
+}
+
 typedef enum ConfigMatchType ConfigMatchType;
 typedef struct ConfigEntry ConfigEntry;
 typedef struct ActiveProcess ActiveProcess;
@@ -117,7 +155,7 @@ void on_signal(int sig) {
     g_discord_events_waiting = 1;
     break;
   default:
-    printf("warning: on_signal(%d) unexpected\n", sig);
+    log_error("on_signal(%d) unexpected", sig);
     break;
   }
 }
@@ -128,17 +166,17 @@ int setup_sigterm_handler(sigset_t *orig_mask) {
   action.sa_handler = on_signal;
 
   if (sigaction(SIGTERM, &action, NULL) == -1) {
-    perror("sigaction(SIGTERM)");
+    log_errno(errno, "sigaction(SIGTERM)");
     return -1;
   }
 
   if (sigaction(SIGINT, &action, NULL) == -1) {
-    perror("sigaction(SIGINT)");
+    log_errno(errno, "sigaction(SIGINT)");
     return -1;
   }
 
   if (sigaction(SIGUSR1, &action, NULL) == -1) {
-    perror("sigaction(SIGUSR1)");
+    log_errno(errno, "sigaction(SIGUSR1)");
     return -1;
   }
 
@@ -149,7 +187,7 @@ int setup_sigterm_handler(sigset_t *orig_mask) {
   sigaddset(&mask, SIGUSR1);
 
   if (sigprocmask(SIG_BLOCK, &mask, orig_mask) == -1) {
-    perror("sigprocmask(SIG_BLOCK, {SIGTERM, SIGUSR1})");
+    log_errno(errno, "sigprocmask(SIG_BLOCK, {SIGTERM, SIGUSR1})");
     return -1;
   }
 
@@ -161,7 +199,7 @@ int netlink_init() {
 
   cleanup(closep) int nlfd = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_CONNECTOR);
   if (nlfd == -1) {
-    perror("socket(PF_NETLINK)");
+    log_errno(errno, "socket(PF_NETLINK)");
     return -1;
   }
 
@@ -171,7 +209,7 @@ int netlink_init() {
   nl_addr.nl_pid = pid;
 
   if (bind(nlfd, (struct sockaddr *)&nl_addr, sizeof(nl_addr)) == -1) {
-    perror("bind(AF_NETLINK)");
+    log_errno(errno, "bind(AF_NETLINK)");
     return -1;
   }
 
@@ -193,7 +231,7 @@ int netlink_init() {
   msg->len = sizeof(enum proc_cn_mcast_op);
 
   if (send(nlfd, hdr, hdr->nlmsg_len, 0) == -1) {
-    perror("send(nlfd)");
+    log_errno(errno, "send(nlfd)");
     return -1;
   }
 
@@ -203,7 +241,7 @@ int netlink_init() {
 int epoll_init(int nlfd) {
   cleanup(closep) int epfd = epoll_create1(0);
   if (epfd == -1) {
-    perror("epoll_create1");
+    log_errno(errno, "epoll_create1");
     return -1;
   }
 
@@ -211,7 +249,7 @@ int epoll_init(int nlfd) {
   ev.events = EPOLLIN;
   ev.data.fd = nlfd;
   if (epoll_ctl(epfd, EPOLL_CTL_ADD, nlfd, &ev)) {
-    perror("epoll_ctl(EPOLL_CTL_ADD)");
+    log_errno(errno, "epoll_ctl(EPOLL_CTL_ADD)");
     return -1;
   }
 
@@ -237,7 +275,7 @@ int load_config() {
   if (config_home == NULL) {
     homefd = openat(-1, getenv("HOME"), O_RDONLY|O_DIRECTORY);
     if (homefd == -1) {
-      perror("openat(${HOME})");
+      log_errno(errno, "openat(${HOME})");
       return -1;
     }
 
@@ -246,26 +284,26 @@ int load_config() {
 
   cleanup(closep) int root_configfd = openat(homefd, config_home, O_RDONLY|O_DIRECTORY);
   if (root_configfd == -1) {
-    perror("openat(${XDG_CONFIG_HOME})");
+    log_errno(errno, "openat(${XDG_CONFIG_HOME})");
     return -1;
   }
 
   cleanup(closep) int dir_configfd = openat(root_configfd, "discord-linux-rpc",
                                             O_RDONLY|O_DIRECTORY);
   if (dir_configfd == -1) {
-    perror("openat(${XDG_CONFIG_HOME}/discord-linux-rpc)");
+    log_errno(errno, "openat(${XDG_CONFIG_HOME}/discord-linux-rpc)");
     return -1;
   }
 
   cleanup(closep) int configfd = openat(dir_configfd, "proc", O_RDONLY);
   if (configfd == -1) {
-    perror("openat(${XDG_CONFIG_HOME}/discord-linux-rpc/proc)");
+    log_errno(errno, "openat(${XDG_CONFIG_HOME}/discord-linux-rpc/proc)");
     return -1;
   }
 
   cleanup(fclosep) FILE *fp = fdopen(configfd, "r");
   if (fp == NULL) {
-    perror("fdopen(${XDG_CONFIG_HOME}/discord-linux-rpc/proc)");
+    log_errno(errno, "fdopen(${XDG_CONFIG_HOME}/discord-linux-rpc/proc)");
     return -1;
   }
   steali(&configfd);
@@ -281,7 +319,7 @@ int load_config() {
       if (feof(fp)) {
         break;
       } else {
-        perror("getline(config)");
+        log_errno(errno, "getline(config)");
         return -1;
       }
     }
@@ -357,7 +395,7 @@ int load_config() {
     continue;
 
 invalid_line:
-    fprintf(stderr, "Invalid line in config: %s\n", line);
+    log_error("Invalid line in config: %s", line);
     return -1;
   }
 
@@ -390,7 +428,7 @@ void free_active_process() {
 
 void update_discord_presence() {
   if (g_active.pid != -1) {
-    printf("update_discord_presence: %u:%s(%s)\n", g_active.pid, g_active.path, g_active.name);
+    log_info("update_discord_presence: %u:%s(%s)", g_active.pid, g_active.path, g_active.name);
     Discord_Shutdown();
 
     Discord_Initialize(g_active.client_id, NULL, 0, NULL);
@@ -408,13 +446,13 @@ void update_discord_presence() {
 int read_boot_time(int procfd) {
   cleanup(closep) int statfd = openat(procfd, "stat", O_RDONLY);
   if (statfd == -1) {
-    perror("openat(/proc/stat)");
+    log_errno(errno, "openat(/proc/stat)");
     return -1;
   }
 
   cleanup(fclosep) FILE *fp = fdopen(statfd, "r");
   if (fp == NULL) {
-    perror("fdopen(/proc/stat)");
+    log_errno(errno, "fdopen(/proc/stat)");
     return -1;
   }
   steali(&statfd);
@@ -427,7 +465,7 @@ int read_boot_time(int procfd) {
       if (feof(fp)) {
         break;
       } else {
-        perror("getline(/proc/stat)");
+        log_errno(errno, "getline(/proc/stat)");
         return -1;
       }
     }
@@ -441,12 +479,12 @@ int read_boot_time(int procfd) {
   return -1;
 }
 
-void read_process_info(int pidfd, char **path, char **name, int64_t *start) {
+void read_process_info(const char *pid, int pidfd, char **path, char **name, int64_t *start) {
   char linkbuf[PATH_MAX];
   ssize_t written = readlinkat(pidfd, "exe", linkbuf, sizeof(linkbuf) - 1);
   if (written == -1) {
-    if (errno != ENOENT) {
-      perror("readlinkat(procfd/pid/exe)");
+    if (errno != ENOENT && errno != EACCES) {
+      log_errno(errno, "readlinkat(procfd/%s/exe)", pid);
     }
     goto after_link;
   }
@@ -461,22 +499,21 @@ after_link: ;
 
   cmdfd = openat(pidfd, "cmdline", O_RDONLY);
   if (cmdfd == -1) {
-    perror("openat(procfd/pid/cmdline)");
+    log_errno(errno, "openat(procfd/%s/cmdline)", pid);
     goto after_name;
   }
 
   cmdfp = fdopen(cmdfd, "r");
   if (cmdfp == NULL) {
-    perror("fdopen(procfd/pid/cmdline)");
+    log_errno(errno, "fdopen(procfd/%s/cmdline)", pid);
     goto after_name;
   }
   steali(&cmdfd);
 
   size_t len;
   if (getdelim(name, &len, '\0', cmdfp) == -1) {
-    // ???
-    if (errno != ENOENT) {
-      perror("getdelim(procfd/pid/cmdline)");
+    if (errno != ENOENT && errno != EACCES) {
+      log_errno(errno, "getdelim(procfd/%s/cmdline)", pid);
     }
     free(stealp(name));
     goto after_name;
@@ -491,13 +528,13 @@ after_name: ;
 
   statfd = openat(pidfd, "stat", O_RDONLY);
   if (statfd == -1) {
-    perror("openat(procfd/pid/stat)");
+    log_errno(errno, "openat(procfd/%s/stat)", pid);
     goto after_stat;
   }
 
   statfp = fdopen(statfd, "r");
   if (statfp == NULL) {
-    perror("fdopen(procfd/pid/stat)");
+    log_errno(errno, "fdopen(procfd/%s/stat)", pid);
     goto after_stat;
   }
   steali(&statfd);
@@ -505,7 +542,7 @@ after_name: ;
   for (int i = 0; i < 22; i++) {
     cleanup(freep) char *part = NULL;
     if (getdelim(&part, &len, ' ', statfp) == -1) {
-      perror("getdelim(procfd/pid/stat)");
+      log_errno(errno, "getdelim(procfd/%s/stat)", pid);
       goto after_stat;
     }
 
@@ -565,7 +602,7 @@ ConfigEntry * try_set_active_process_pidstr(int procfd, const char *pid, ConfigE
   cleanup(closep) int pidfd = openat(procfd, pid, O_DIRECTORY|O_RDONLY);
   if (pidfd == -1) {
     if (errno != ENOENT) {
-      perror("openat(procfd/pid)");
+      log_errno(errno, "openat(procfd/%s)", pid);
     }
     return NULL;
   }
@@ -573,7 +610,7 @@ ConfigEntry * try_set_active_process_pidstr(int procfd, const char *pid, ConfigE
   cleanup(freep) char *path = NULL;
   cleanup(freep) char *name = NULL;
   int64_t start = -1;
-  read_process_info(pidfd, &path, &name, &start);
+  read_process_info(pid, pidfd, &path, &name, &start);
 
   if (path == NULL && name == NULL) {
     return NULL;
@@ -587,7 +624,7 @@ ConfigEntry * try_set_active_process_pidstr(int procfd, const char *pid, ConfigE
     g_active.start = start;
     g_active.client_id = strdup(entry->client_id);
     g_active.state = strdup0(entry->state);
-    printf("Set active process to %u:%s(%s)\n", g_active.pid, g_active.path, g_active.name);
+    log_info("Set active process to %u:%s(%s)", g_active.pid, g_active.path, g_active.name);
     return entry;
   }
 
@@ -604,7 +641,7 @@ ConfigEntry * try_set_active_process_pid(int procfd, pid_t pid, ConfigEntry *sto
 void find_active_process(int procfd) {
   /* cleanup(closep) int procfd2 = dup(procfd); */
   /* if (procfd2 == -1) { */
-  /*   perror("dup(procfd)"); */
+  /*   log_errno(errno, "dup(procfd)"); */
   /*   return; */
   /* } */
 
@@ -612,7 +649,7 @@ void find_active_process(int procfd) {
   /* cleanup(closedirp) DIR *dir = fdopendir(procfd2); */
   cleanup(closedirp) DIR *dir = opendir("/proc");
   if (dir == NULL) {
-    perror("fdopendir(/proc)");
+    log_errno(errno, "fdopendir(/proc)");
     return;
   }
   /* steali(&procfd2); */
@@ -627,7 +664,7 @@ void find_active_process(int procfd) {
     struct dirent *entry = readdir(dir);
     if (entry == NULL) {
       if (errno) {
-        perror("readdir(/proc)");
+        log_errno(errno, "readdir(/proc)");
       }
       break;
     }
@@ -680,7 +717,7 @@ int handle_events(int nlfd, int epfd, sigset_t *orig_mask) {
 
   cleanup(closep) int procfd = openat(-1, "/proc", O_DIRECTORY|O_RDONLY);
   if (procfd == -1) {
-    perror("openat(/proc)");
+    log_errno(errno, "openat(/proc)");
     return -1;
   }
 
@@ -701,7 +738,7 @@ int handle_events(int nlfd, int epfd, sigset_t *orig_mask) {
           Discord_RunCallbacks();
         }
       } else {
-        perror("epoll_pwait");
+        log_errno(errno, "epoll_pwait");
       }
 
       continue;
@@ -711,7 +748,7 @@ int handle_events(int nlfd, int epfd, sigset_t *orig_mask) {
       if (events[i].data.fd == nlfd) {
         if (recv(nlfd, buf, sizeof(buf), MSG_DONTWAIT) == -1) {
           if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            perror("recv");
+            log_errno(errno, "recv");
           }
 
           continue;
