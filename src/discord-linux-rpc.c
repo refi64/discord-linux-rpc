@@ -377,11 +377,6 @@ int load_config() {
       goto invalid_line;
     }
 
-    p = skip_ws(p + 5);
-    if (*p == '\0') {
-      goto invalid_line;
-    }
-
     rchomp(line);
     rchomp(p);
     rchomp(match);
