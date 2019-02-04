@@ -2,7 +2,9 @@
 Description=Discord rich presence process monitor
 
 [Service]
-Exec=@prefix@/@bindir@/discord-linux-rpc
+Type=notify
+ExecStart=@prefix@/@bindir@/discord-linux-rpc
+ExecReload=@kill@ -HUP $MAINPID
 
 [Install]
 WantedBy=default.target

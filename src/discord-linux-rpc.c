@@ -112,6 +112,8 @@ __attribute__((format(printf, 2, 3))) void log_errno(int errno_, const char *fmt
   fprintf(stderr, ": %s\n", strerror(errno_));
 
   va_end(args);
+
+  sd_notifyf(0, "ERRNO=%d", errno_);
 }
 
 typedef enum ConfigMatchType ConfigMatchType;
@@ -143,16 +145,26 @@ ActiveProcess g_active = {-1, NULL, NULL, -1, NULL, NULL};
 
 int64_t g_boot_time = -1;
 
-sig_atomic_t g_is_done = 0, g_discord_events_waiting = 0;
+enum {
+  PENDING_SIG_NONE,
+  PENDING_SIG_EXIT,
+  PENDING_SIG_DISCORD_EVENTS_WAITING,
+  PENDING_SIG_RELOAD_CONFIG,
+};
+
+sig_atomic_t g_pending_signal = 0;
 
 void on_signal(int sig) {
   switch (sig) {
   case SIGTERM:
   case SIGINT:
-    g_is_done = 1;
+    g_pending_signal = PENDING_SIG_EXIT;
     break;
   case SIGUSR1:
-    g_discord_events_waiting = 1;
+    g_pending_signal = PENDING_SIG_DISCORD_EVENTS_WAITING;
+    break;
+  case SIGHUP:
+    g_pending_signal = PENDING_SIG_RELOAD_CONFIG;
     break;
   default:
     log_error("on_signal(%d) unexpected", sig);
@@ -165,29 +177,21 @@ int setup_sigterm_handler(sigset_t *orig_mask) {
   bzero(&action, sizeof(action));
   action.sa_handler = on_signal;
 
-  if (sigaction(SIGTERM, &action, NULL) == -1) {
-    log_errno(errno, "sigaction(SIGTERM)");
-    return -1;
-  }
-
-  if (sigaction(SIGINT, &action, NULL) == -1) {
-    log_errno(errno, "sigaction(SIGINT)");
-    return -1;
-  }
-
-  if (sigaction(SIGUSR1, &action, NULL) == -1) {
-    log_errno(errno, "sigaction(SIGUSR1)");
-    return -1;
-  }
+  int signals[] = {SIGTERM, SIGINT, SIGUSR1, SIGHUP};
 
   sigset_t mask;
   sigemptyset(&mask);
-  sigaddset(&mask, SIGTERM);
-  sigaddset(&mask, SIGINT);
-  sigaddset(&mask, SIGUSR1);
+
+  for (int i = 0; i < sizeof(signals)/sizeof(signals[0]); i++) {
+    if (sigaction(signals[i], &action, NULL) == -1) {
+      log_errno(errno, "sigaction(%d)", signals[i]);
+    }
+
+    sigaddset(&mask, signals[i]);
+  }
 
   if (sigprocmask(SIG_BLOCK, &mask, orig_mask) == -1) {
-    log_errno(errno, "sigprocmask(SIG_BLOCK, {SIGTERM, SIGUSR1})");
+    log_errno(errno, "sigprocmask(SIG_BLOCK, {...})");
     return -1;
   }
 
@@ -324,6 +328,8 @@ int load_config() {
       }
     }
 
+    rchomp(line);
+
     p = skip_ws(line);
     if (*p == '\0') {
       continue;
@@ -377,7 +383,6 @@ int load_config() {
       goto invalid_line;
     }
 
-    rchomp(line);
     rchomp(p);
     rchomp(match);
 
@@ -721,18 +726,44 @@ int handle_events(int nlfd, int epfd, sigset_t *orig_mask) {
     return -1;
   }
 
-  find_active_process(procfd);
+  if (load_config() == -1) {
+    free_config();
+  } else {
+    find_active_process(procfd);
+  }
+
   update_discord_presence();
+
+  sd_notify(0, "READY=1");
 
   for (;;) {
     int nev = epoll_pwait(epfd, events, EPOLL_EVENT_COUNT, -1, orig_mask);
     if (nev == -1) {
       if (errno == EINTR) {
-        if (g_is_done) {
+        switch (g_pending_signal) {
+        case PENDING_SIG_EXIT:
+          sd_notify(0, "STOPPING=1");
           return 0;
-        } else if (g_discord_events_waiting) {
+        case PENDING_SIG_DISCORD_EVENTS_WAITING:
           Discord_RunCallbacks();
+          break;
+        case PENDING_SIG_RELOAD_CONFIG:
+          sd_notify(0, "RELOADING=1");
+          free_config();
+
+          if (load_config() == -1) {
+            free_config();
+            free_active_process();
+          } else {
+            find_active_process(procfd);
+          }
+
+          update_discord_presence();
+          sd_notify(0, "READY=1");
+          break;
         }
+
+        g_pending_signal = PENDING_SIG_NONE;
       } else {
         log_errno(errno, "epoll_pwait");
       }
@@ -750,6 +781,12 @@ int handle_events(int nlfd, int epfd, sigset_t *orig_mask) {
           continue;
         }
 
+        /* The handler is here to avoid process events getting backed up */
+
+        if (g_config == NULL) {
+          continue;
+        }
+
         if (hdr->nlmsg_type == NLMSG_DONE) {
           struct proc_event *proc = (struct proc_event *)((struct cn_msg *)NLMSG_DATA(hdr))->data;
           if (proc->what == PROC_EVENT_EXEC || proc->what == PROC_EVENT_EXIT) {
@@ -764,22 +801,17 @@ int handle_events(int nlfd, int epfd, sigset_t *orig_mask) {
 int main(int argc, char **argv, char **envp) {
   sigset_t orig_mask;
   if (setup_sigterm_handler(&orig_mask) == -1) {
-    return 1;
+    return 3;
   }
 
   cleanup(closep) int nlfd = netlink_init();
   if (nlfd == -1) {
-    return 1;
+    return 3;
   }
 
   cleanup(closep) int epfd = epoll_init(nlfd);
   if (epfd == -1) {
-    return 1;
-  }
-
-  if (load_config() == -1) {
-    free_config();
-    return 1;
+    return 3;
   }
 
   int rc = handle_events(nlfd, epfd, &orig_mask);
@@ -788,5 +820,5 @@ int main(int argc, char **argv, char **envp) {
   free_config();
   update_discord_presence();
 
-  return -rc;
+  return rc < 0 ? 3 : 0;
 }
