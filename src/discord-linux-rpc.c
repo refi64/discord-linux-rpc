@@ -430,6 +430,7 @@ void update_discord_presence() {
 
     DiscordRichPresence rp = {0};
     rp.state = g_active.state;
+    rp.largeImageKey = "discord-linux-rpc";
     rp.startTimestamp = g_boot_time + g_active.start;
     Discord_UpdatePresence(&rp);
   } else {
