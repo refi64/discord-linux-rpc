@@ -11,7 +11,6 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <sys/epoll.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 
@@ -20,8 +19,12 @@
 #include <linux/netlink.h>
 
 #include <systemd/sd-daemon.h>
+#include <systemd/sd-event.h>
 
 #include <discord_rpc.h>
+
+#define NLMSG_SEND_LENGTH NLMSG_LENGTH(sizeof(struct cn_msg) + sizeof(enum proc_cn_mcast_op))
+#define NLMSG_RECV_LENGTH NLMSG_LENGTH(sizeof(struct cn_msg) + sizeof(struct proc_event))
 
 char *strdup0(const char *s) {
   return s ? strdup(s) : NULL;
@@ -38,6 +41,18 @@ int endswith(const char *s, const char *e) {
   }
 
   return memcmp(s + (sl - el), e, el) == 0;
+}
+
+char *skip_ws(char *s) {
+  for (; *s && isspace(*s); s++);
+  return s;
+}
+
+void rchomp(char *s) {
+  size_t len = strlen(s);
+  for (char *p = s + len - 1; p != s && isspace(*p); p--) {
+    *p = '\0';
+  }
 }
 
 int steali(int *p) {
@@ -119,6 +134,7 @@ __attribute__((format(printf, 2, 3))) void log_errno(int errno_, const char *fmt
 typedef enum ConfigMatchType ConfigMatchType;
 typedef struct ConfigEntry ConfigEntry;
 typedef struct ActiveProcess ActiveProcess;
+typedef struct Context Context;
 
 struct ConfigEntry {
   enum {
@@ -140,63 +156,12 @@ struct ActiveProcess {
   char *state;
 };
 
-ConfigEntry *g_config = NULL;
-ActiveProcess g_active = {-1, NULL, NULL, -1, NULL, NULL};
-
-int64_t g_boot_time = -1;
-
-enum {
-  PENDING_SIG_NONE,
-  PENDING_SIG_EXIT,
-  PENDING_SIG_DISCORD_EVENTS_WAITING,
-  PENDING_SIG_RELOAD_CONFIG,
+struct Context {
+  int procfd;
+  ConfigEntry *config;
+  ActiveProcess active;
+  int64_t boot_time;
 };
-
-sig_atomic_t g_pending_signal = 0;
-
-void on_signal(int sig) {
-  switch (sig) {
-  case SIGTERM:
-  case SIGINT:
-    g_pending_signal = PENDING_SIG_EXIT;
-    break;
-  case SIGUSR1:
-    g_pending_signal = PENDING_SIG_DISCORD_EVENTS_WAITING;
-    break;
-  case SIGHUP:
-    g_pending_signal = PENDING_SIG_RELOAD_CONFIG;
-    break;
-  default:
-    log_error("on_signal(%d) unexpected", sig);
-    break;
-  }
-}
-
-int setup_sigterm_handler(sigset_t *orig_mask) {
-  struct sigaction action;
-  bzero(&action, sizeof(action));
-  action.sa_handler = on_signal;
-
-  int signals[] = {SIGTERM, SIGINT, SIGUSR1, SIGHUP};
-
-  sigset_t mask;
-  sigemptyset(&mask);
-
-  for (int i = 0; i < sizeof(signals)/sizeof(signals[0]); i++) {
-    if (sigaction(signals[i], &action, NULL) == -1) {
-      log_errno(errno, "sigaction(%d)", signals[i]);
-    }
-
-    sigaddset(&mask, signals[i]);
-  }
-
-  if (sigprocmask(SIG_BLOCK, &mask, orig_mask) == -1) {
-    log_errno(errno, "sigprocmask(SIG_BLOCK, {...})");
-    return -1;
-  }
-
-  return 0;
-}
 
 int netlink_init() {
   pid_t pid = getpid();
@@ -216,9 +181,6 @@ int netlink_init() {
     log_errno(errno, "bind(AF_NETLINK)");
     return -1;
   }
-
-  #define NLMSG_SEND_LENGTH NLMSG_LENGTH(sizeof(struct cn_msg) + sizeof(enum proc_cn_mcast_op))
-  #define NLMSG_RECV_LENGTH NLMSG_LENGTH(sizeof(struct cn_msg) + sizeof(struct proc_event))
 
   char buf[NLMSG_SPACE(NLMSG_SEND_LENGTH)] = {0};
   struct nlmsghdr *hdr = (struct nlmsghdr *)buf;
@@ -242,37 +204,7 @@ int netlink_init() {
   return steali(&nlfd);
 }
 
-int epoll_init(int nlfd) {
-  cleanup(closep) int epfd = epoll_create1(0);
-  if (epfd == -1) {
-    log_errno(errno, "epoll_create1");
-    return -1;
-  }
-
-  struct epoll_event ev;
-  ev.events = EPOLLIN;
-  ev.data.fd = nlfd;
-  if (epoll_ctl(epfd, EPOLL_CTL_ADD, nlfd, &ev)) {
-    log_errno(errno, "epoll_ctl(EPOLL_CTL_ADD)");
-    return -1;
-  }
-
-  return steali(&epfd);
-}
-
-char *skip_ws(char *s) {
-  for (; *s && isspace(*s); s++);
-  return s;
-}
-
-void rchomp(char *s) {
-  size_t len = strlen(s);
-  for (char *p = s + len - 1; p != s && isspace(*p); p--) {
-    *p = '\0';
-  }
-}
-
-int load_config() {
+int config_load(Context *ctx) {
   char *config_home = getenv("XDG_CONFIG_HOME");
 
   cleanup(closep) int homefd = -1;
@@ -335,14 +267,14 @@ int load_config() {
       continue;
     }
 
-    ConfigEntry *new_config = realloc(g_config, (entries + 2) * sizeof(ConfigEntry));
+    ConfigEntry *new_config = realloc(ctx->config, (entries + 2) * sizeof(ConfigEntry));
     if (new_config == NULL) {
       return -1;
     }
 
     ConfigEntry *current = &new_config[entries];
     bzero(current, sizeof(ConfigEntry) * 2);
-    g_config = new_config;
+    ctx->config = new_config;
 
     type = strstr(p, " ");
     if (!type) {
@@ -402,49 +334,7 @@ invalid_line:
   return 0;
 }
 
-void free_config() {
-  if (g_config == NULL) {
-    return;
-  }
-
-  for (ConfigEntry *entry = g_config; entry->type != CONFIG_NULL; entry++) {
-    free(entry->match);
-    free(entry->state);
-  }
-
-  free(stealp(&g_config));
-}
-
-void free_active_process() {
-  if (g_active.pid == -1) {
-    return;
-  }
-
-  g_active.pid = -1;
-  free(stealp(&g_active.path));
-  free(stealp(&g_active.name));
-  free(stealp(&g_active.state));
-}
-
-void update_discord_presence() {
-  if (g_active.pid != -1) {
-    log_info("update_discord_presence: %u:%s(%s)", g_active.pid, g_active.path, g_active.name);
-    Discord_Shutdown();
-
-    Discord_Initialize(g_active.client_id, NULL, 0, NULL);
-
-    DiscordRichPresence rp = {0};
-    rp.state = g_active.state;
-    rp.largeImageKey = "discord-linux-rpc";
-    rp.startTimestamp = g_boot_time + g_active.start;
-    Discord_UpdatePresence(&rp);
-  } else {
-    puts("update_discord_presence: clear active");
-    Discord_Shutdown();
-  }
-}
-
-int read_boot_time(int procfd) {
+int64_t read_boot_time(int procfd) {
   cleanup(closep) int statfd = openat(procfd, "stat", O_RDONLY);
   if (statfd == -1) {
     log_errno(errno, "openat(/proc/stat)");
@@ -472,12 +362,75 @@ int read_boot_time(int procfd) {
     }
 
     if (startswith(line, "btime ")) {
-      g_boot_time = strtoll(line + 5, NULL, 10);
-      return 0;
+      return strtoll(line + 5, NULL, 10);
     }
   }
 
   return -1;
+}
+
+int context_open(Context *ctx) {
+  ctx->procfd = openat(-1, "/proc", O_DIRECTORY|O_RDONLY);
+  if (ctx->procfd == -1) {
+    log_errno(errno, "openat(/proc)");
+    return -1;
+  }
+
+  ctx->boot_time = read_boot_time(ctx->procfd);
+  if (ctx->boot_time == -1) {
+    return -1;
+  }
+
+  return 0;
+}
+
+void config_free(Context *ctx) {
+  if (ctx->config == NULL) {
+    return;
+  }
+
+  for (ConfigEntry *entry = ctx->config; entry->type != CONFIG_NULL; entry++) {
+    free(entry->match);
+    free(entry->state);
+  }
+
+  free(stealp(&ctx->config));
+}
+
+void active_process_free(Context *ctx) {
+  if (ctx->active.pid == -1) {
+    return;
+  }
+
+  ctx->active.pid = -1;
+  free(stealp(&ctx->active.path));
+  free(stealp(&ctx->active.name));
+  free(stealp(&ctx->active.state));
+}
+
+void context_free(Context *ctx) {
+  closep(&ctx->procfd);
+  active_process_free(ctx);
+  config_free(ctx);
+}
+
+void update_discord_presence(Context *ctx) {
+  if (ctx->active.pid != -1) {
+    log_info("update_discord_presence: %u:%s(%s)", ctx->active.pid, ctx->active.path,
+             ctx->active.name);
+    Discord_Shutdown();
+
+    Discord_Initialize(ctx->active.client_id, NULL, 0, NULL);
+
+    DiscordRichPresence rp = {0};
+    rp.state = ctx->active.state;
+    rp.largeImageKey = "discord-linux-rpc";
+    rp.startTimestamp = ctx->boot_time + ctx->active.start;
+    Discord_UpdatePresence(&rp);
+  } else {
+    log_info("update_discord_presence: clear active");
+    Discord_Shutdown();
+  }
 }
 
 void read_process_info(const char *pid, int pidfd, char **path, char **name, int64_t *start) {
@@ -561,8 +514,9 @@ after_stat: ;
   return;
 }
 
-ConfigEntry * find_matching_entry(const char *path, const char *name, ConfigEntry *stop_at) {
-  for (ConfigEntry *entry = g_config; entry->type != CONFIG_NULL; entry++) {
+ConfigEntry * find_matching_entry(ConfigEntry *entry, const char *path, const char *name,
+                                  ConfigEntry *stop_at) {
+  for (; entry->type != CONFIG_NULL; entry++) {
     if (entry == stop_at) {
       return NULL;
     }
@@ -599,8 +553,9 @@ ConfigEntry * find_matching_entry(const char *path, const char *name, ConfigEntr
   return NULL;
 }
 
-ConfigEntry * try_set_active_process_pidstr(int procfd, const char *pid, ConfigEntry *stop_at) {
-  cleanup(closep) int pidfd = openat(procfd, pid, O_DIRECTORY|O_RDONLY);
+ConfigEntry * try_set_active_process_pidstr(Context *ctx, const char *pid,
+                                            ConfigEntry *stop_at) {
+  cleanup(closep) int pidfd = openat(ctx->procfd, pid, O_DIRECTORY|O_RDONLY);
   if (pidfd == -1) {
     if (errno != ENOENT) {
       log_errno(errno, "openat(procfd/%s)", pid);
@@ -617,29 +572,30 @@ ConfigEntry * try_set_active_process_pidstr(int procfd, const char *pid, ConfigE
     return NULL;
   }
 
-  ConfigEntry *entry = find_matching_entry(path, name, stop_at);
+  ConfigEntry *entry = find_matching_entry(ctx->config, path, name, stop_at);
   if (entry != NULL) {
-    g_active.pid = strtol(pid, NULL, 10);
-    g_active.path = stealp(&path);
-    g_active.name = stealp(&name);
-    g_active.start = start;
-    g_active.client_id = strdup(entry->client_id);
-    g_active.state = strdup0(entry->state);
-    log_info("Set active process to %u:%s(%s)", g_active.pid, g_active.path, g_active.name);
+    ctx->active.pid = strtol(pid, NULL, 10);
+    ctx->active.path = stealp(&path);
+    ctx->active.name = stealp(&name);
+    ctx->active.start = start;
+    ctx->active.client_id = strdup(entry->client_id);
+    ctx->active.state = strdup0(entry->state);
+    log_info("Set active process to %u:%s(%s)", ctx->active.pid, ctx->active.path,
+             ctx->active.name);
     return entry;
   }
 
   return NULL;
 }
 
-ConfigEntry * try_set_active_process_pid(int procfd, pid_t pid, ConfigEntry *stop_at) {
+ConfigEntry * try_set_active_process_pid(Context *ctx, pid_t pid, ConfigEntry *stop_at) {
   char pidbuf[16];
   snprintf(pidbuf, sizeof(pidbuf), "%u", pid);
 
-  return try_set_active_process_pidstr(procfd, pidbuf, stop_at);
+  return try_set_active_process_pidstr(ctx, pidbuf, stop_at);
 }
 
-void find_active_process(int procfd) {
+void active_process_find(Context *ctx) {
   /* cleanup(closep) int procfd2 = dup(procfd); */
   /* if (procfd2 == -1) { */
   /*   log_errno(errno, "dup(procfd)"); */
@@ -656,8 +612,8 @@ void find_active_process(int procfd) {
   /* steali(&procfd2); */
 
   ConfigEntry *active = NULL;
-  if (g_active.pid != -1) {
-    active = find_matching_entry(g_active.path, g_active.name, NULL);
+  if (ctx->active.pid != -1) {
+    active = find_matching_entry(ctx->config, ctx->active.path, ctx->active.name, NULL);
   }
 
   for (;;) {
@@ -681,144 +637,177 @@ void find_active_process(int procfd) {
       continue;
     }
 
-    ConfigEntry *new_active = try_set_active_process_pidstr(procfd, entry->d_name, active);
+    ConfigEntry *new_active = try_set_active_process_pidstr(ctx, entry->d_name, active);
     if (new_active != NULL) {
       active = new_active;
     }
   }
 }
 
-void handle_process_event(int procfd, struct proc_event *proc) {
-  if (proc->what == PROC_EVENT_EXEC) {
-    ConfigEntry *active = NULL;
-    pid_t orig_pid = g_active.pid;
-    if (orig_pid != -1) {
-      active = find_matching_entry(g_active.path, g_active.name, NULL);
-    }
-
-    try_set_active_process_pid(procfd, proc->event_data.exec.process_pid, active);
-
-    if (orig_pid != g_active.pid) {
-      update_discord_presence();
-    }
-  } else if (proc->what == PROC_EVENT_EXIT &&
-             proc->event_data.exit.process_pid == g_active.pid) {
-    free_active_process();
-    find_active_process(procfd);
-
-    update_discord_presence();
-  }
+int on_discord_events_waiting(sd_event_source *s, const struct signalfd_siginfo *si, void *ud) {
+  Discord_RunCallbacks();
+  return 0;
 }
 
-int handle_events(int nlfd, int epfd, sigset_t *orig_mask) {
-  #define EPOLL_EVENT_COUNT 16
-  struct epoll_event events[EPOLL_EVENT_COUNT];
+int on_config_reload_request(sd_event_source *s, const struct signalfd_siginfo *si, void *ud) {
+  Context *ctx = ud;
+  sd_notify(0, "RELOADING=1");
+  config_free(ctx);
+
+  if (config_load(ctx) == -1) {
+    config_free(ctx);
+    active_process_free(ctx);
+  } else {
+    active_process_find(ctx);
+  }
+
+  update_discord_presence(ctx);
+  sd_notify(0, "READY=1");
+
+  return 0;
+}
+
+int on_process_event(sd_event_source *s, int fd, uint32_t revents, void *ud) {
+  Context *ctx = ud;
+
   char buf[NLMSG_SPACE(NLMSG_RECV_LENGTH)] = {0};
   struct nlmsghdr *hdr = (struct nlmsghdr *)buf;
 
-  cleanup(closep) int procfd = openat(-1, "/proc", O_DIRECTORY|O_RDONLY);
-  if (procfd == -1) {
-    log_errno(errno, "openat(/proc)");
-    return -1;
-  }
-
-  if (read_boot_time(procfd) == -1) {
-    return -1;
-  }
-
-  if (load_config() == -1) {
-    free_config();
-  } else {
-    find_active_process(procfd);
-  }
-
-  update_discord_presence();
-
-  sd_notify(0, "READY=1");
-
-  for (;;) {
-    int nev = epoll_pwait(epfd, events, EPOLL_EVENT_COUNT, -1, orig_mask);
-    if (nev == -1) {
-      if (errno == EINTR) {
-        switch (g_pending_signal) {
-        case PENDING_SIG_EXIT:
-          sd_notify(0, "STOPPING=1");
-          return 0;
-        case PENDING_SIG_DISCORD_EVENTS_WAITING:
-          Discord_RunCallbacks();
-          break;
-        case PENDING_SIG_RELOAD_CONFIG:
-          sd_notify(0, "RELOADING=1");
-          free_config();
-
-          if (load_config() == -1) {
-            free_config();
-            free_active_process();
-          } else {
-            find_active_process(procfd);
-          }
-
-          update_discord_presence();
-          sd_notify(0, "READY=1");
-          break;
-        }
-
-        g_pending_signal = PENDING_SIG_NONE;
-      } else {
-        log_errno(errno, "epoll_pwait");
-      }
-
-      continue;
+  if (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) == -1) {
+    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+      log_errno(errno, "recv");
     }
 
-    for (int i = 0; i < nev; i++) {
-      if (events[i].data.fd == nlfd) {
-        if (recv(nlfd, buf, sizeof(buf), MSG_DONTWAIT) == -1) {
-          if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            log_errno(errno, "recv");
-          }
+    return 0;
+  }
 
-          continue;
-        }
+  if (ctx->config == NULL) {
+    return 0;
+  }
 
-        /* The handler is here to avoid process events getting backed up */
-
-        if (g_config == NULL) {
-          continue;
-        }
-
-        if (hdr->nlmsg_type == NLMSG_DONE) {
-          struct proc_event *proc = (struct proc_event *)((struct cn_msg *)NLMSG_DATA(hdr))->data;
-          if (proc->what == PROC_EVENT_EXEC || proc->what == PROC_EVENT_EXIT) {
-            handle_process_event(procfd, proc);
-          }
-        }
+  if (hdr->nlmsg_type == NLMSG_DONE) {
+    struct proc_event *proc = (struct proc_event *)((struct cn_msg *)NLMSG_DATA(hdr))->data;
+    if (proc->what == PROC_EVENT_EXEC) {
+      ConfigEntry *active = NULL;
+      pid_t orig_pid = ctx->active.pid;
+      if (orig_pid != -1) {
+        active = find_matching_entry(ctx->config, ctx->active.path, ctx->active.name, NULL);
       }
+
+      try_set_active_process_pid(ctx, proc->event_data.exec.process_pid, active);
+
+      if (orig_pid != ctx->active.pid) {
+        update_discord_presence(ctx);
+      }
+    } else if (proc->what == PROC_EVENT_EXIT &&
+               proc->event_data.exit.process_pid == ctx->active.pid) {
+      active_process_free(ctx);
+      active_process_find(ctx);
+
+      update_discord_presence(ctx);
     }
   }
+
+  return 0;
 }
 
-int main(int argc, char **argv, char **envp) {
-  sigset_t orig_mask;
-  if (setup_sigterm_handler(&orig_mask) == -1) {
-    return 3;
+int setup_signal_handlers(Context *ctx, sd_event *event) {
+  sigset_t mask;
+  sigemptyset(&mask);
+  sigaddset(&mask, SIGINT);
+  sigaddset(&mask, SIGTERM);
+  sigaddset(&mask, SIGHUP);
+  sigaddset(&mask, SIGUSR1);
+
+  if (sigprocmask(SIG_BLOCK, &mask, NULL) == -1) {
+    log_errno(errno, "sigprocmask(SIG_BLOCK, {...})");
+    return -1;
   }
 
+  int rc = 0;
+
+  if ((rc = sd_event_add_signal(event, NULL, SIGINT, NULL, NULL)) < 0 ||
+      (rc = sd_event_add_signal(event, NULL, SIGTERM, NULL, NULL))) {
+    log_errno(-rc, "sd_event_add_signal({SIGINT, SIGTERM})");
+    return -1;
+  }
+
+  rc = sd_event_add_signal(event, NULL, SIGHUP, on_config_reload_request, ctx);
+  if (rc < 0) {
+    log_errno(-rc, "sd_event_add_signal(SIGHUP)");
+    return -1;
+  }
+
+  rc = sd_event_add_signal(event, NULL, SIGUSR1, on_discord_events_waiting, NULL);
+  if (rc < 0) {
+    log_errno(-rc, "sd_event_add_signal(SIGUSR1)");
+    return -1;
+  }
+
+  return 0;
+}
+
+sd_event *event_init(Context *ctx, int nlfd) {
+  cleanup(sd_event_unrefp) sd_event *event = NULL;
+
+  int rc = sd_event_default(&event);
+  if (rc < 0) {
+    log_errno(-rc, "sd_event_default");
+    return NULL;
+  }
+
+  rc = sd_event_set_watchdog(event, 1);
+  if (rc < 0) {
+    log_errno(-rc, "sd_event_set_watchdog");
+    return NULL;
+  }
+
+  rc = sd_event_add_io(event, NULL, nlfd, EPOLLIN, on_process_event, ctx);
+  if (rc < 0) {
+    log_errno(-rc, "sd_event_add_io(netlink)");
+    return NULL;
+  }
+
+  if (setup_signal_handlers(ctx, event) == -1) {
+    return NULL;
+  }
+
+  return stealp(&event);
+}
+
+int main() {
   cleanup(closep) int nlfd = netlink_init();
   if (nlfd == -1) {
     return 3;
   }
 
-  cleanup(closep) int epfd = epoll_init(nlfd);
-  if (epfd == -1) {
+  cleanup(context_free) Context ctx = {0};
+  if (context_open(&ctx) == -1) {
     return 3;
   }
 
-  int rc = handle_events(nlfd, epfd, &orig_mask);
+  cleanup(sd_event_unrefp) sd_event *event = event_init(&ctx, nlfd);
+  if (event == NULL) {
+    return 3;
+  }
 
-  free_active_process();
-  free_config();
-  update_discord_presence();
+  if (config_load(&ctx) == -1) {
+    config_free(&ctx);
+  } else {
+    active_process_find(&ctx);
+  }
 
-  return rc < 0 ? 3 : 0;
+  update_discord_presence(&ctx);
+  sd_notify(0, "READY=1");
+
+  int rc = sd_event_loop(event);
+  sd_notify(0, "STOPPING=1");
+  Discord_Shutdown();
+
+  if (rc < 0) {
+    log_errno(-rc, "sd_event_loop");
+    return 3;
+  }
+
+  return 0;
 }
