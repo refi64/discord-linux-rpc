@@ -331,7 +331,7 @@ int load_config() {
     rchomp(line);
 
     p = skip_ws(line);
-    if (*p == '\0') {
+    if (*p == '\0' || *p == '#') {
       continue;
     }
 
