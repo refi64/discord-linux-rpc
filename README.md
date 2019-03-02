@@ -20,6 +20,7 @@ You need:
 - A C compiler
 - [Meson](https://mesonbuild.com/) and Ninja
 - systemd and libsystemd
+- libcap/setcap
 
 Just run:
 
