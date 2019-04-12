@@ -16,13 +16,19 @@
 #include <unistd.h>
 
 #include <sys/socket.h>
+#include <sys/un.h>
 
 #include <systemd/sd-daemon.h>
 #include <systemd/sd-event.h>
 
+/* #include <yajl/yajl_parse.h> */
+#include <yajl/yajl_gen.h>
+
 #include <prkit.h>
 
-#include <discord_rpc.h>
+#define DISCORD_MAX_RPC_FRAME_SIZE (64 * 1024)
+
+typedef unsigned char uchar;
 
 char *strdup0(const char *s) {
   return s ? strdup(s) : NULL;
@@ -92,6 +98,12 @@ void closedirp(DIR **p) {
   }
 }
 
+void yajl_gen_freep(yajl_gen *p) {
+  if (*p) {
+    yajl_gen_free(stealp(p));
+  }
+}
+
 void logv(const char *prefix, const char *fmt, va_list args) {
   fputs(prefix, stderr);
   vfprintf(stderr, fmt, args);
@@ -129,10 +141,35 @@ __attribute__((format(printf, 2, 3))) void log_errno(int errno_, const char *fmt
   sd_notifyf(0, "ERRNO=%d", errno_);
 }
 
+__attribute__((format(printf, 2, 3))) void log_yajl_gen(yajl_gen_status status, const char *fmt,
+                                                        ...) {
+  va_list args;
+  va_start(args, fmt);
+
+  logv(SD_ERR, fmt, args);
+
+  fputs(":", stderr);
+
+  switch (status) {
+  case yajl_gen_status_ok: fputs("OK\n", stderr); break;
+  case yajl_gen_keys_must_be_strings: fputs("Keys must be strings\n", stderr); break;
+  case yajl_max_depth_exceeded: fputs("Max depth exceeded\n", stderr); break;
+  case yajl_gen_in_error_state: fputs("Already in error state\n", stderr); break;
+  case yajl_gen_generation_complete: fputs("Generation complete\n", stderr); break;
+  case yajl_gen_invalid_number: fputs("Invalid number\n", stderr); break;
+  case yajl_gen_no_buf: fputs("No buffer\n", stderr); break;
+  case yajl_gen_invalid_string: fputs("Invalid utf-8 string\n", stderr); break;
+  }
+
+  va_end(args);
+}
+
 typedef enum ConfigMatchType ConfigMatchType;
 typedef struct ConfigEntry ConfigEntry;
 typedef struct ActiveProcess ActiveProcess;
 typedef struct Context Context;
+typedef struct RpcHeader RpcHeader;
+typedef struct RpcMessage RpcMessage;
 
 struct ConfigEntry {
   enum {
@@ -156,9 +193,35 @@ struct ActiveProcess {
 
 struct Context {
   int procfd;
+  int rpcfd;
+  enum {
+    RPC_DISCONNECTED,
+    RPC_WAITING_RECONNECT,
+    RPC_AUTH_PRE,
+    RPC_AUTH_WAIT,
+    RPC_READY,
+  } rpcstate;
+  char *rpc_client_id;
+  unsigned long rpc_nonce;
   ConfigEntry *config;
   ActiveProcess active;
   int64_t boot_time;
+};
+
+struct RpcHeader {
+  enum {
+    RPC_OP_HANDSHAKE = 0,
+    RPC_OP_FRAME = 1,
+    RPC_OP_CLOSE = 2,
+    RPC_OP_PING = 3,
+    RPC_OP_PONG = 4,
+  } op;
+  uint32_t len;
+};
+
+struct RpcMessage {
+  RpcHeader hdr;
+  char data[DISCORD_MAX_RPC_FRAME_SIZE - sizeof(RpcHeader)];
 };
 
 int config_load(Context *ctx) {
@@ -309,6 +372,8 @@ int context_open(Context *ctx) {
     return -1;
   }
 
+  ctx->rpcfd = -1;
+
   ctx->boot_time = read_boot_time(ctx->procfd);
   if (ctx->boot_time == -1) {
     return -1;
@@ -343,26 +408,310 @@ void active_process_free(Context *ctx) {
 
 void context_free(Context *ctx) {
   closep(&ctx->procfd);
+  closep(&ctx->rpcfd);
+  freep(&ctx->rpc_client_id);
   active_process_free(ctx);
   config_free(ctx);
 }
 
-void update_discord_presence(Context *ctx) {
+int on_discord_reconnect_event(sd_event_source *s, uint64_t usec, void *ud);
+
+void discord_schedule_reconnect(sd_event *event, Context *ctx) {
+  if (ctx->rpcstate == RPC_WAITING_RECONNECT) {
+    return;
+  }
+
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1) {
+    log_errno(errno, "clock_gettime");
+    return;
+  }
+
+  // Dispatch after a 5-second delay.
+  ts.tv_sec += 5;
+  uint64_t usec = ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+
+  int rc = sd_event_add_time(event, NULL, CLOCK_MONOTONIC, usec, 60000000,
+                             on_discord_reconnect_event, ctx);
+  if (rc < 0) {
+    log_errno(-rc, "sd_event_add_time");
+    return;
+  }
+
+  log_info("rpc waiting reconnect");
+  ctx->rpcstate = RPC_WAITING_RECONNECT;
+}
+
+void discord_update_presence(Context *ctx);
+
+int on_discord_rpc_event(sd_event_source *s, int rpcfd, uint32_t revents, void *ud) {
+  Context *ctx = ud;
+
+  if (revents & (EPOLLERR | EPOLLHUP)) {
+    // Force reconnect.
+    log_info("rpc poll error, scheduling reconnect...");
+    closep(&ctx->rpcfd);
+    discord_schedule_reconnect(sd_event_source_get_event(s), ctx);
+    return -1;
+  }
+
+  RpcMessage msg;
+  bzero(&msg, sizeof(msg));
+
+  if (recv(rpcfd, &msg.hdr, sizeof(msg.hdr), 0) < 0) {
+    log_errno(errno, "recv on frame header");
+    return 0;
+  }
+
+  if (msg.hdr.len != 0) {
+    if (recv(rpcfd, msg.data, msg.hdr.len, 0) < 0) {
+      log_errno(errno, "recv on frame message");
+      return 0;
+    }
+  }
+
+  switch (msg.hdr.op) {
+  case RPC_OP_FRAME:
+    // XXX
+    if (ctx->rpcstate == RPC_AUTH_WAIT &&
+        memmem(msg.data, msg.hdr.len, "READY", strlen("READY")) != NULL) {
+      log_info("rpc ready");
+      ctx->rpcstate = RPC_READY;
+
+      discord_update_presence(ctx);
+    } else {
+      log_info("frame %*s", msg.hdr.len, msg.data);
+    }
+    break;
+  case RPC_OP_PING:
+    if (send(rpcfd, &msg, sizeof(msg.hdr) + msg.hdr.len, 0) < 0) {
+      log_errno(errno, "send ping");
+    }
+    break;
+  case RPC_OP_PONG:
+    // Pong.
+    break;
+  default:
+    log_error("Unknown RPC op code: %d", msg.hdr.op);
+    // Fallthrough.
+  case RPC_OP_HANDSHAKE:
+  case RPC_OP_CLOSE:
+    closep(&ctx->rpcfd);
+    discord_schedule_reconnect(sd_event_source_get_event(s), ctx);
+    return -1;
+  }
+
+  return 0;
+}
+
+int discord_send_handshake(Context *ctx) {
+  cleanup(yajl_gen_freep) yajl_gen gen = yajl_gen_alloc(NULL);
+  yajl_gen_status gs = yajl_gen_status_ok;
+
+  const char *json = NULL;
+  size_t json_len;
+  if ((gs = yajl_gen_map_open(gen))
+      || (gs = yajl_gen_string(gen, (const uchar *)"v", strlen("v")))
+      || (gs = yajl_gen_integer(gen, 1))
+      || (gs = yajl_gen_string(gen, (const uchar *)"client_id", strlen("client_id")))
+      || (gs = yajl_gen_string(gen, (const uchar *)ctx->active.client_id,
+                               strlen(ctx->active.client_id)))
+      || (gs = yajl_gen_map_close(gen))
+      || (gs = yajl_gen_get_buf(gen, (const uchar **)&json, &json_len))) {
+    log_yajl_gen(gs, "handshake");
+    return -1;
+  }
+
+  RpcMessage msg;
+  msg.hdr.op = RPC_OP_HANDSHAKE;
+  msg.hdr.len = json_len;
+  strncpy(msg.data, json, sizeof(msg.data));
+
+  if (send(ctx->rpcfd, &msg, sizeof(msg.hdr) + msg.hdr.len, 0) < 0) {
+    log_errno(errno, "handshake send");
+    return -1;
+  }
+
+  freep(&ctx->rpc_client_id);
+  ctx->rpc_client_id = strdup(ctx->active.client_id);
+
+  return 0;
+}
+
+void discord_update_connection(Context *ctx) {
+  if (ctx->rpcfd != -1 && ctx->rpcstate > RPC_AUTH_PRE) {
+    // We've already sent an auth handshake, so disconnect and reconnect.
+    closep(&ctx->rpcfd);
+  }
+
+  ctx->rpcstate = RPC_DISCONNECTED;
+
+  cleanup(sd_event_unrefp) sd_event *event = NULL;
+  int rc = sd_event_default(&event);
+  if (rc < 0) {
+    log_errno(-rc, "sd_event_default");
+    return;
+  }
+
+  if (ctx->rpcfd == -1) {
+    cleanup(closep) int rpcfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (rpcfd == -1) {
+      log_errno(-errno, "discord_update_connection socket");
+      return;
+    }
+
+    const char *xdg_runtime_dir = getenv("XDG_RUNTIME_DIR");
+
+    for (int i = 0; i < 9; i++) {
+      for (int j = 0; j < 2; j++) {
+        struct sockaddr_un addr;
+        bzero(&addr, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+
+        if (j == 0) {
+          snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/discord-ipc-%d", xdg_runtime_dir, i);
+        } else {
+          snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/discord/ipc-%d", xdg_runtime_dir, i);
+        }
+
+        if (connect(rpcfd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+          if (errno != -ENOENT) {
+            log_errno(errno, "bind %s", addr.sun_path);
+          }
+
+          continue;
+        }
+
+        // Add the fd to our event loop.
+        rc = sd_event_add_io(event, NULL, rpcfd, EPOLLIN, on_discord_rpc_event, ctx);
+        if (rc < 0) {
+          log_errno(-rc, "sd_event_add_io(rpcfd)");
+        }
+
+        ctx->rpcfd = steali(&rpcfd);
+        goto rpc_connected;
+      }
+    }
+
+    // All failed, reschedule a connection attempt for later.
+    discord_schedule_reconnect(event, ctx);
+    return;
+  }
+
+  rpc_connected:
+
+  if (ctx->active.pid == -1) {
+    // We can't auth yet, wait until later to connect.
+    log_info("rpc auth pre");
+    ctx->rpcstate = RPC_AUTH_PRE;
+    return;
+  }
+
+  // Send the handshake.
+  if (discord_send_handshake(ctx) == -1) {
+    return;
+  }
+
+  ctx->rpcstate = RPC_AUTH_WAIT;
+}
+
+int on_discord_reconnect_event(sd_event_source *s, uint64_t usec, void *ud) {
+  Context *ctx = ud;
+  if (ctx->rpcfd != -1) {
+    // We're already connected by someone else.
+    return 0;
+  }
+
+  discord_update_connection(ctx);
+
+  return 0;
+}
+
+void discord_update_presence(Context *ctx) {
+  if (ctx->rpcstate != RPC_READY || strcmp(ctx->active.client_id, ctx->rpc_client_id) != 0) {
+    discord_update_connection(ctx);
+    return;
+  }
+
+  cleanup(yajl_gen_freep) yajl_gen gen = yajl_gen_alloc(NULL);
+  yajl_gen_status gs = yajl_gen_status_ok;
+
+  char nonce[16];
+  snprintf(nonce, sizeof(nonce), "%lu", ctx->rpc_nonce++);
+
+  const char *state = ctx->active.state;
+  pid_t pid = ctx->active.pid;
+  if (pid < 10) {
+    pid = getpid();
+  }
+
+  if ((gs = yajl_gen_map_open(gen))
+      || (gs = yajl_gen_string(gen, (const uchar *)"cmd", strlen("cmd")))
+      || (gs = yajl_gen_string(gen, (const uchar *)"SET_ACTIVITY", strlen("SET_ACTIVITY")))
+      || (gs = yajl_gen_string(gen, (const uchar *)"nonce", strlen("nonce")))
+      || (gs = yajl_gen_string(gen, (const uchar *)nonce, strlen(nonce)))
+      || (gs = yajl_gen_string(gen, (const uchar *)"args", strlen("args")))
+      || (gs = yajl_gen_map_open(gen))
+      || (gs = yajl_gen_string(gen, (const uchar *)"pid", strlen("pid")))
+      || (gs = yajl_gen_integer(gen, pid))) {
+    log_yajl_gen(gs, "presence main object");
+    return;
+  }
+
   if (ctx->active.pid != -1) {
-    log_info("update_discord_presence: %u:%s(%s)", ctx->active.pid, ctx->active.path,
+    log_info("discord_update_presence: %u:%s(%s)", ctx->active.pid, ctx->active.path,
              ctx->active.name);
-    Discord_Shutdown();
 
-    Discord_Initialize(ctx->active.client_id, NULL, 0, NULL);
+    if ((gs = yajl_gen_string(gen, (const uchar *)"activity", strlen("activity")))
+        || (gs = yajl_gen_map_open(gen))) {
+      log_yajl_gen(gs, "presence activity object opening");
+      return;
+    }
 
-    DiscordRichPresence rp = {0};
-    rp.state = ctx->active.state;
-    rp.largeImageKey = "discord-linux-rpc";
-    rp.startTimestamp = ctx->boot_time + ctx->active.start;
-    Discord_UpdatePresence(&rp);
+    if (state != NULL) {
+      if ((gs = yajl_gen_string(gen, (const uchar *)"state", strlen("state")))
+          || (gs = yajl_gen_string(gen, (const uchar *)state, strlen(state)))) {
+        log_yajl_gen(gs, "presence activity state");
+        return;
+      }
+    }
+
+    if ((gs = yajl_gen_string(gen, (const uchar *)"assets", strlen("assets")))
+        || (gs = yajl_gen_map_open(gen))
+        || (gs = yajl_gen_string(gen, (const uchar *)"large_image", strlen("large_image")))
+        || (gs = yajl_gen_string(gen, (const uchar *)"discord-linux-rpc",
+                                 strlen("discord-linux-rpc")))
+        || (gs = yajl_gen_map_close(gen))
+        || (gs = yajl_gen_string(gen, (const uchar *)"timestamps", strlen("timestamps")))
+        || (gs = yajl_gen_map_open(gen))
+        || (gs = yajl_gen_string(gen, (const uchar *)"start", strlen("start")))
+        || (gs = yajl_gen_integer(gen, ctx->boot_time + ctx->active.start))
+        || (gs = yajl_gen_map_close(gen))
+        || (gs = yajl_gen_map_close(gen))) {
+      log_yajl_gen(gs, "presence activity");
+      return;
+    }
   } else {
-    log_info("update_discord_presence: clear active");
-    Discord_Shutdown();
+    log_info("discord_update_presence: clear active");
+  }
+
+  const char *json;
+  size_t json_len;
+
+  if ((gs = yajl_gen_map_close(gen))
+      || (gs = yajl_gen_map_close(gen))
+      || (gs = yajl_gen_get_buf(gen, (const uchar **)&json, &json_len))) {
+    log_yajl_gen(gs, "presence finish");
+    return;
+  }
+
+  RpcMessage msg;
+  msg.hdr.op = RPC_OP_FRAME;
+  msg.hdr.len = json_len;
+  strncpy(msg.data, json, sizeof(msg.data));
+
+  if (send(ctx->rpcfd, &msg, sizeof(msg.hdr) + msg.hdr.len, 0) < 0) {
+    log_errno(errno, "presence send");
   }
 }
 
@@ -515,11 +864,6 @@ void active_process_find(Context *ctx) {
   }
 }
 
-int on_discord_events_waiting(sd_event_source *s, const struct signalfd_siginfo *si, void *ud) {
-  Discord_RunCallbacks();
-  return 0;
-}
-
 int on_config_reload_request(sd_event_source *s, const struct signalfd_siginfo *si, void *ud) {
   Context *ctx = ud;
   sd_notify(0, "RELOADING=1");
@@ -532,7 +876,7 @@ int on_config_reload_request(sd_event_source *s, const struct signalfd_siginfo *
     active_process_find(ctx);
   }
 
-  update_discord_presence(ctx);
+  discord_update_presence(ctx);
   sd_notify(0, "READY=1");
 
   return 0;
@@ -558,7 +902,7 @@ int on_process_event(sd_event_source *s, int nlfd, uint32_t revents, void *ud) {
       try_set_active_process_pid(ctx, proc.event_data.exec.process_pid, active);
 
       if (orig_pid != ctx->active.pid) {
-        update_discord_presence(ctx);
+        discord_update_presence(ctx);
       }
     }
 
@@ -566,7 +910,7 @@ int on_process_event(sd_event_source *s, int nlfd, uint32_t revents, void *ud) {
       active_process_free(ctx);
       active_process_find(ctx);
 
-      update_discord_presence(ctx);
+      discord_update_presence(ctx);
     }
   }
 
@@ -597,12 +941,6 @@ int setup_signal_handlers(Context *ctx, sd_event *event) {
   rc = sd_event_add_signal(event, NULL, SIGHUP, on_config_reload_request, ctx);
   if (rc < 0) {
     log_errno(-rc, "sd_event_add_signal(SIGHUP)");
-    return -1;
-  }
-
-  rc = sd_event_add_signal(event, NULL, SIGUSR1, on_discord_events_waiting, NULL);
-  if (rc < 0) {
-    log_errno(-rc, "sd_event_add_signal(SIGUSR1)");
     return -1;
   }
 
@@ -661,12 +999,11 @@ int main() {
     active_process_find(&ctx);
   }
 
-  update_discord_presence(&ctx);
+  discord_update_presence(&ctx);
   sd_notify(0, "READY=1");
 
   rc = sd_event_loop(event);
   sd_notify(0, "STOPPING=1");
-  Discord_Shutdown();
 
   if (rc < 0) {
     log_errno(-rc, "sd_event_loop");

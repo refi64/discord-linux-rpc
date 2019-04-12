@@ -11,9 +11,11 @@ via rich presence.
 
 ## Installation
 
-RPMs will come SOON(tm), for now you have to build from scratch.
+RPMs will come SOON(tm), for now you have to build from source.
 
-## Building
+## Installing from source
+
+### Requirements
 
 You need:
 
@@ -21,12 +23,22 @@ You need:
 - [Meson](https://mesonbuild.com/) and Ninja
 - systemd and libsystemd
 - libcap/setcap
+- [yajl](https://lloyd.github.io/yajl/)
+
+```bash
+# Installing dependencies on Fedora
+$ sudo dnf install gcc meson libcap systemd-devel yajl-devel
+# Installing dependencies on Arch
+$ sudo pacman -S base-devel libcap meson yajl
+```
+
+### Building and installing
 
 Just run:
 
 ```
 # configure
-$ meson _build --prefix=/usr
+$ meson _build
 # build and install (you shouldn't need root, Meson will use polkit if possible)
 $ ninja -C _build install
 ```
