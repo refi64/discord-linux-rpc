@@ -15,20 +15,14 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <sys/prctl.h>
 #include <sys/socket.h>
-
-#include <linux/cn_proc.h>
-#include <linux/connector.h>
-#include <linux/netlink.h>
 
 #include <systemd/sd-daemon.h>
 #include <systemd/sd-event.h>
 
-#include <discord_rpc.h>
+#include <prkit.h>
 
-#define NLMSG_SEND_LENGTH NLMSG_LENGTH(sizeof(struct cn_msg) + sizeof(enum proc_cn_mcast_op))
-#define NLMSG_RECV_LENGTH NLMSG_LENGTH(sizeof(struct cn_msg) + sizeof(struct proc_event))
+#include <discord_rpc.h>
 
 char *strdup0(const char *s) {
   return s ? strdup(s) : NULL;
@@ -167,47 +161,6 @@ struct Context {
   int64_t boot_time;
 };
 
-int netlink_init() {
-  pid_t pid = getpid();
-
-  cleanup(closep) int nlfd = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_CONNECTOR);
-  if (nlfd == -1) {
-    log_errno(errno, "socket(PF_NETLINK)");
-    return -1;
-  }
-
-  struct sockaddr_nl nl_addr = {0};
-  nl_addr.nl_family = AF_NETLINK;
-  nl_addr.nl_groups = CN_IDX_PROC;
-  nl_addr.nl_pid = pid;
-
-  if (bind(nlfd, (struct sockaddr *)&nl_addr, sizeof(nl_addr)) == -1) {
-    log_errno(errno, "bind(AF_NETLINK)");
-    return -1;
-  }
-
-  char buf[NLMSG_SPACE(NLMSG_SEND_LENGTH)] = {0};
-  struct nlmsghdr *hdr = (struct nlmsghdr *)buf;
-  hdr->nlmsg_len = NLMSG_SEND_LENGTH;
-  hdr->nlmsg_type = NLMSG_DONE;
-  hdr->nlmsg_pid = pid;
-
-  struct cn_msg *msg = (struct cn_msg *)NLMSG_DATA(hdr);
-  msg->id.idx = CN_IDX_PROC;
-  msg->id.val = CN_VAL_PROC;
-
-  enum proc_cn_mcast_op *op = (enum proc_cn_mcast_op *)msg->data;
-  *op = PROC_CN_MCAST_LISTEN;
-  msg->len = sizeof(enum proc_cn_mcast_op);
-
-  if (send(nlfd, hdr, hdr->nlmsg_len, 0) == -1) {
-    log_errno(errno, "send(nlfd)");
-    return -1;
-  }
-
-  return steali(&nlfd);
-}
-
 int config_load(Context *ctx) {
   char *config_home = getenv("XDG_CONFIG_HOME");
 
@@ -339,44 +292,20 @@ invalid_line:
 }
 
 int64_t read_boot_time(int procfd) {
-  cleanup(closep) int statfd = openat(procfd, "stat", O_RDONLY);
-  if (statfd == -1) {
-    log_errno(errno, "openat(/proc/stat)");
+  struct prkit_kernel_stat kstat;
+  int rc = prkit_kernel_stat(procfd, &kstat);
+  if (rc < 0) {
+    log_errno(-rc, "prkit_kernel_stat");
     return -1;
   }
 
-  cleanup(fclosep) FILE *fp = fdopen(statfd, "r");
-  if (fp == NULL) {
-    log_errno(errno, "fdopen(/proc/stat)");
-    return -1;
-  }
-  steali(&statfd);
-
-  for (;;) {
-    cleanup(freep) char *line = NULL;
-    size_t len = 0;
-
-    if (getline(&line, &len, fp) == -1) {
-      if (feof(fp)) {
-        break;
-      } else {
-        log_errno(errno, "getline(/proc/stat)");
-        return -1;
-      }
-    }
-
-    if (startswith(line, "btime ")) {
-      return strtoll(line + 5, NULL, 10);
-    }
-  }
-
-  return -1;
+  return kstat.fields & PRKIT_KERNEL_STAT_BTIME ? kstat.btime : -1;
 }
 
 int context_open(Context *ctx) {
-  ctx->procfd = openat(-1, "/proc", O_DIRECTORY|O_RDONLY);
-  if (ctx->procfd == -1) {
-    log_errno(errno, "openat(/proc)");
+  int rc = prkit_open(&ctx->procfd);
+  if (rc < 0) {
+    log_errno(-rc, "prkit_open");
     return -1;
   }
 
@@ -437,81 +366,43 @@ void update_discord_presence(Context *ctx) {
   }
 }
 
-void read_process_info(const char *pid, int pidfd, char **path, char **name, int64_t *start) {
-  char linkbuf[PATH_MAX];
-  ssize_t written = readlinkat(pidfd, "exe", linkbuf, sizeof(linkbuf) - 1);
-  if (written == -1) {
-    if (errno != ENOENT && errno != EACCES) {
-      log_errno(errno, "readlinkat(procfd/%s/exe)", pid);
+void read_process_info(int pid, int pidfd, char **path, char **name, int64_t *start) {
+  cleanup(freep) char *exe = NULL;
+  int rc = 0;
+
+  rc = prkit_pid_resolve_exe(pidfd, &exe, NULL);
+  if (rc < 0) {
+    if (rc != -ENOENT && rc != -EACCES) {
+      log_errno(-rc, "prkit_pid_resolve_exe(%d)", pid);
     }
     goto after_link;
   }
 
-  linkbuf[written] = '\0';
-  *path = strdup(linkbuf);
+  *path = stealp(&exe);
 
 after_link: ;
 
-  cleanup(closep) int cmdfd = -1;
-  cleanup(fclosep) FILE *cmdfp = NULL;
-
-  cmdfd = openat(pidfd, "cmdline", O_RDONLY);
-  if (cmdfd == -1) {
-    log_errno(errno, "openat(procfd/%s/cmdline)", pid);
-    goto after_name;
-  }
-
-  cmdfp = fdopen(cmdfd, "r");
-  if (cmdfp == NULL) {
-    log_errno(errno, "fdopen(procfd/%s/cmdline)", pid);
-    goto after_name;
-  }
-  steali(&cmdfd);
-
-  size_t len;
-  if (getdelim(name, &len, '\0', cmdfp) == -1) {
-    if (errno != ENOENT && errno != EACCES) {
-      log_errno(errno, "getdelim(procfd/%s/cmdline)", pid);
+  cleanup(prkit_free_strvp) char **cmdline_strv = NULL;
+  rc = prkit_pid_cmdline_strv(pidfd, &cmdline_strv);
+  if (rc < 0) {
+    if (-rc != -ENOENT && -rc != -EACCES) {
+      log_errno(-rc, "prkit_pid_cmdline_strv(%d)", pid);
     }
-    free(stealp(name));
     goto after_name;
   }
+
+  *name = strdup0(cmdline_strv[0]);
 
 after_name: ;
 
-  cleanup(closep) int statfd = -1;
-  cleanup(fclosep) FILE *statfp = NULL;
-  cleanup(freep) char *starttime_s = NULL;\
-  uint64_t starttime = 0;
-
-  statfd = openat(pidfd, "stat", O_RDONLY);
-  if (statfd == -1) {
-    log_errno(errno, "openat(procfd/%s/stat)", pid);
+  struct prkit_pid_stat pstat;
+  rc = prkit_pid_stat(pidfd, &pstat);
+  if (rc < 0) {
+    log_errno(-rc, "prkit_pid_stat(%d)", pid);
     goto after_stat;
   }
 
-  statfp = fdopen(statfd, "r");
-  if (statfp == NULL) {
-    log_errno(errno, "fdopen(procfd/%s/stat)", pid);
-    goto after_stat;
-  }
-  steali(&statfd);
-
-  for (int i = 0; i < 22; i++) {
-    cleanup(freep) char *part = NULL;
-    if (getdelim(&part, &len, ' ', statfp) == -1) {
-      log_errno(errno, "getdelim(procfd/%s/stat)", pid);
-      goto after_stat;
-    }
-
-    if (i == 21) {
-      // Last item is starttime
-      starttime_s = stealp(&part);
-    }
-  }
-
-  starttime = strtoull(starttime_s, NULL, 10);
-  *start = starttime / sysconf(_SC_CLK_TCK);
+  *start = pstat.starttime / sysconf(_SC_CLK_TCK);
 
 after_stat: ;
 
@@ -557,12 +448,12 @@ ConfigEntry * find_matching_entry(ConfigEntry *entry, const char *path, const ch
   return NULL;
 }
 
-ConfigEntry * try_set_active_process_pidstr(Context *ctx, const char *pid,
-                                            ConfigEntry *stop_at) {
-  cleanup(closep) int pidfd = openat(ctx->procfd, pid, O_DIRECTORY|O_RDONLY);
-  if (pidfd == -1) {
-    if (errno != ENOENT) {
-      log_errno(errno, "openat(procfd/%s)", pid);
+ConfigEntry * try_set_active_process_pid(Context *ctx, int pid, ConfigEntry *stop_at) {
+  cleanup(closep) int pidfd = -1;
+  int rc = prkit_pid_open(ctx->procfd, pid, &pidfd);
+  if (rc < 0) {
+    if (rc != -ENOENT) {
+      log_errno(-rc, "prkit_open(%d)", pid);
     }
     return NULL;
   }
@@ -578,7 +469,7 @@ ConfigEntry * try_set_active_process_pidstr(Context *ctx, const char *pid,
 
   ConfigEntry *entry = find_matching_entry(ctx->config, path, name, stop_at);
   if (entry != NULL) {
-    ctx->active.pid = strtol(pid, NULL, 10);
+    ctx->active.pid = pid;
     ctx->active.path = stealp(&path);
     ctx->active.name = stealp(&name);
     ctx->active.start = start;
@@ -592,58 +483,34 @@ ConfigEntry * try_set_active_process_pidstr(Context *ctx, const char *pid,
   return NULL;
 }
 
-ConfigEntry * try_set_active_process_pid(Context *ctx, pid_t pid, ConfigEntry *stop_at) {
-  char pidbuf[16];
-  snprintf(pidbuf, sizeof(pidbuf), "%u", pid);
-
-  return try_set_active_process_pidstr(ctx, pidbuf, stop_at);
-}
-
 void active_process_find(Context *ctx) {
-  /* cleanup(closep) int procfd2 = dup(procfd); */
-  /* if (procfd2 == -1) { */
-  /*   log_errno(errno, "dup(procfd)"); */
-  /*   return; */
-  /* } */
-
-  /* XXX: fdopendir will cause /proc to always be empty, even when dup'd */
-  /* cleanup(closedirp) DIR *dir = fdopendir(procfd2); */
-  cleanup(closedirp) DIR *dir = opendir("/proc");
-  if (dir == NULL) {
-    log_errno(errno, "fdopendir(/proc)");
-    return;
-  }
-  /* steali(&procfd2); */
-
   ConfigEntry *active = NULL;
   if (ctx->active.pid != -1) {
     active = find_matching_entry(ctx->config, ctx->active.path, ctx->active.name, NULL);
   }
 
+  int rc = prkit_walk_reset(ctx->procfd);
+  if (rc < 0) {
+    log_errno(-rc, "prkit_walk_reset");
+    return;
+  }
+
+  int pids[32];
   for (;;) {
-    errno = 0;
-    struct dirent *entry = readdir(dir);
-    if (entry == NULL) {
-      if (errno) {
-        log_errno(errno, "readdir(/proc)");
-      }
+    size_t count = sizeof(pids) / sizeof(pids[0]);
+    rc = prkit_walk_read(ctx->procfd, pids, &count);
+    if (rc < 0) {
+      log_errno(-rc, "prkit_walk_read");
+      break;
+    } else if (count == 0) {
       break;
     }
 
-    int all_digits = 1;
-    for (char *p = entry->d_name; *p != '\0'; p++) {
-      if (!isdigit(*p)) {
-        all_digits = 0;
+    for (int i = 0; i < count; i++) {
+      ConfigEntry *new_active = try_set_active_process_pid(ctx, pids[i], active);
+      if (new_active != NULL) {
+        active = new_active;
       }
-    }
-
-    if (!all_digits) {
-      continue;
-    }
-
-    ConfigEntry *new_active = try_set_active_process_pidstr(ctx, entry->d_name, active);
-    if (new_active != NULL) {
-      active = new_active;
     }
   }
 }
@@ -671,40 +538,31 @@ int on_config_reload_request(sd_event_source *s, const struct signalfd_siginfo *
   return 0;
 }
 
-int on_process_event(sd_event_source *s, int fd, uint32_t revents, void *ud) {
+int on_process_event(sd_event_source *s, int nlfd, uint32_t revents, void *ud) {
   Context *ctx = ud;
 
-  char buf[NLMSG_SPACE(NLMSG_RECV_LENGTH)] = {0};
-  struct nlmsghdr *hdr = (struct nlmsghdr *)buf;
+  struct proc_event proc;
+  bzero(&proc, sizeof(proc));
+  int rc = prkit_monitor_read_event(nlfd, &proc);
 
-  if (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) == -1) {
-    if (errno != EAGAIN && errno != EWOULDBLOCK) {
-      log_errno(errno, "recv");
-    }
-
-    return 0;
-  }
-
-  if (ctx->config == NULL) {
-    return 0;
-  }
-
-  if (hdr->nlmsg_type == NLMSG_DONE) {
-    struct proc_event *proc = (struct proc_event *)((struct cn_msg *)NLMSG_DATA(hdr))->data;
-    if (proc->what == PROC_EVENT_EXEC) {
+  if (rc < 0) {
+    log_errno(-rc, "prkit_monitor_read_event");
+  } else {
+    if (proc.what & PROC_EVENT_EXEC) {
       ConfigEntry *active = NULL;
       pid_t orig_pid = ctx->active.pid;
       if (orig_pid != -1) {
         active = find_matching_entry(ctx->config, ctx->active.path, ctx->active.name, NULL);
       }
 
-      try_set_active_process_pid(ctx, proc->event_data.exec.process_pid, active);
+      try_set_active_process_pid(ctx, proc.event_data.exec.process_pid, active);
 
       if (orig_pid != ctx->active.pid) {
         update_discord_presence(ctx);
       }
-    } else if (proc->what == PROC_EVENT_EXIT &&
-               proc->event_data.exit.process_pid == ctx->active.pid) {
+    }
+
+    if (proc.what & PROC_EVENT_EXIT && proc.event_data.exit.process_pid == ctx->active.pid) {
       active_process_free(ctx);
       active_process_find(ctx);
 
@@ -780,8 +638,10 @@ sd_event *event_init(Context *ctx, int nlfd) {
 }
 
 int main() {
-  cleanup(closep) int nlfd = netlink_init();
-  if (nlfd == -1) {
+  cleanup(closep) int nlfd = -1;
+  int rc = prkit_monitor_open(&nlfd);
+  if (rc < 0) {
+    log_errno(-rc, "prkit_monitor_open");
     return 3;
   }
 
@@ -804,7 +664,7 @@ int main() {
   update_discord_presence(&ctx);
   sd_notify(0, "READY=1");
 
-  int rc = sd_event_loop(event);
+  rc = sd_event_loop(event);
   sd_notify(0, "STOPPING=1");
   Discord_Shutdown();
 

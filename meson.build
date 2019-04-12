@@ -6,6 +6,7 @@ libdiscordrpc_proj = subproject('discord-rpc')
 libdiscordrpc_dep = libdiscordrpc_proj.get_variable('libdiscordrpc_dep')
 
 libsystemd_dep = dependency('libsystemd')
+prkit_dep = dependency('prkit', fallback : ['prkit', 'prkit_dep'])
 
 prefix = get_option('prefix')
 bindir = get_option('bindir')
@@ -21,5 +22,5 @@ configure_file(input : 'misc/discord-linux-rpc.service.in', output : 'discord-li
                install_dir : join_paths(prefix, 'lib', 'systemd', 'user'))
 
 executable('discord-linux-rpc', 'src/discord-linux-rpc.c',
-           dependencies : [libdiscordrpc_dep, libsystemd_dep], install : true)
+           dependencies : [libdiscordrpc_dep, libsystemd_dep, prkit_dep], install : true)
 meson.add_install_script('misc/setcap-net-admin.sh')
